@@ -1,0 +1,140 @@
+;; cut -- POSIX cut (IEEE Std 1003.1), the single-field form.
+;;
+;;   cut -f N FILE        field N, delimited by TAB
+;;   cut -dX -fN FILE     field N, delimited by X
+;;
+;; ## A line with no delimiter is printed WHOLE
+;;
+;; That is the behaviour, not an edge case to work around: `cut -d: -f2` over
+;; a line reading `nofield` answers `nofield`, not the empty string.
+;; (`-s` suppresses such lines; this does not implement `-s`.) Measured
+;; against /usr/bin/cut 2026-09-10.
+;;
+;; ## The default delimiter is a TAB, not a space
+;;
+;; Measured on the same day: `cut -f2` over `a:b:c` answers `a:b:c` -- the
+;; whole line, because there is no tab in it -- and over `one<TAB>two` it
+;; answers `two`.
+;;
+;; A tab cannot be written in Kotoba source (no control characters, no
+;; char-to-string builtin), so it is cut from the listing wire's own
+;; separator the same way a newline is cut from a two-line literal.
+;;
+;; Capabilities: :cli/args (38), :fs/app-data (35), :io/write (37),
+;; :io/write-error (39).
+(ns cut.core (:export [main]))
+
+(defn arg [i :string] :string
+  (typed-cap-call :cli/args :string :string i))
+
+(defn emit [s :string] :string
+  (typed-cap-call :io/write :string :string s))
+
+(defn emit-error [s :string] :string
+  (typed-cap-call :io/write-error :string :string s))
+
+(defn slurp-file [path :string] :string
+  (typed-cap-call :fs/app-data :string :string path))
+
+(defn readable? [path :string] :bool
+  (string=? (typed-cap-call :fs/app-data :string :string
+                            (string-concat path "EXISTS_SEP"))
+            "1"))
+
+(defn nl [] :string
+  (string-substring "a
+b" 1 2))
+
+;; A one-byte tab, cut from a literal that contains one.
+(defn tab [] :string
+  (string-substring "a	b" 1 2))
+
+(defn digit-value [s :string i :i64] :i64
+  (let [c (string-code-point-at s i)]
+    (if (< c 48) -1 (if (> c 57) -1 (- c 48)))))
+
+(defn text->i64 [s :string i :i64 n :i64 acc :i64] :i64
+  (if (>= i n)
+    acc
+    (let [d (digit-value s i)]
+      (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
+
+(defn parse-count [s :string] :i64
+  (let [n (string-byte-length s)]
+    (if (= n 0) -1 (text->i64 s 0 n 0))))
+
+;; --- argument shapes -----------------------------------------------------
+;; `cut -fN FILE`      -> 2 arguments
+;; `cut -dX -fN FILE`  -> 3 arguments
+(defn dashed? [] :bool
+  (string=? (arg "") "3"))
+
+(defn delim [] :string
+  (if (dashed?)
+    (string-substring (arg "0") 2 (string-byte-length (arg "0")))
+    (tab)))
+
+(defn field-text [] :string
+  (let [a (if (dashed?) (arg "1") (arg "0"))]
+    (string-substring a 2 (string-byte-length a))))
+
+(defn path-arg [] :string
+  (if (dashed?) (arg "2") (arg "1")))
+
+;; --- the field walk ------------------------------------------------------
+
+;; The nth field of LINE, or the WHOLE line when the delimiter does not occur
+;; in it, or the empty string when the line has fewer fields than n.
+(defn nth-field [line :string d :string n :i64] :string
+  (let [i (string-index-of line d)]
+    (if (< i 0)
+      ;; Out of delimiters. At n = 1 the remainder IS the last field; past it
+      ;; the line has fewer fields than were asked for and the answer is
+      ;; empty.
+      ;;
+      ;; Returning the remainder here instead was wrong in a way only one
+      ;; case showed: `-f4` over a three-field line answered `c` where cut
+      ;; answers nothing, and `-f1` `-f2` `-f3` all agreed. The line with NO
+      ;; delimiter at all is a different question, and `field-of` below asks
+      ;; it before this walk starts.
+      (if (= n 1) line "")
+      (if (= n 1)
+        (string-substring line 0 i)
+        (nth-field (string-substring line (+ i (string-byte-length d))
+                                     (string-byte-length line))
+                   d (- n 1))))))
+
+;; A line that HAS the delimiter but too few fields answers the empty string,
+;; which is different from a line that has none at all.
+(defn field-of [line :string d :string n :i64] :string
+  (if (< (string-index-of line d) 0)
+    line
+    (nth-field line d n)))
+
+(defn walk [rest :string d :string n :i64] :i64
+  (let [i (string-index-of rest "\n")]
+    (if (< i 0)
+      (if (= (string-byte-length rest) 0)
+        0
+        (do (emit (field-of rest d n)) (emit (nl)) 0))
+      (do
+        (emit (field-of (string-substring rest 0 i) d n))
+        (emit (nl))
+        (walk (string-substring rest (+ i 1) (string-byte-length rest)) d n)))))
+
+(defn main [] :i64
+  (let [n (parse-count (field-text))
+        path (path-arg)]
+    (if (< n 1)
+      (do
+        (emit-error "cut: [-cf] list: illegal list value")
+        (emit-error (nl))
+        1)
+      (if (readable? path)
+        (walk (slurp-file path) (delim) n)
+        (do
+          (emit-error "cut: ")
+          (emit-error path)
+          (emit-error ": No such file or directory")
+          (emit-error (nl))
+          1)))))

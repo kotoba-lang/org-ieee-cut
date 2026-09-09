@@ -55,7 +55,9 @@
    ;; A leading and a trailing delimiter: the empty field on each side is a
    ;; field.
    "edges"  ":lead\ntrail:\n"
-   "utf8"   "\u65e5:\u672c:\u8a9e\n"})
+   "utf8"   "\u65e5:\u672c:\u8a9e\n"
+   ;; Five fields, so ranges have room on both sides.
+   "wide"   "a:b:c:d:e\n"})
 
 (def cases
   [["-d:" "-f1" "colon"] ["-d:" "-f2" "colon"] ["-d:" "-f3" "colon"]
@@ -67,7 +69,32 @@
    ["-d:" "-f1" "edges"] ["-d:" "-f2" "edges"] ["-d:" "-f2" "utf8"]
    ;; No -d: the delimiter is a TAB. `colon` has none, so the whole line.
    ["-f1" "tabs"] ["-f2" "tabs"] ["-f2" "colon"]
-   ["-d:" "-f2" "missing"]])
+   ["-d:" "-f2" "missing"]
+   ;; --- field LISTS and RANGES ---------------------------------------
+   ;; The output is ascending and de-duplicated regardless of how the list
+   ;; is written, so `3,1` and `1,1` are the two cases that separate "test
+   ;; each field in order" from "walk the list as given".
+   ["-d:" "-f1,3" "wide"] ["-d:" "-f3,1" "wide"] ["-d:" "-f1,1" "wide"]
+   ["-d:" "-f2-4" "wide"] ["-d:" "-f2-" "wide"] ["-d:" "-f-3" "wide"]
+   ;; Every field, and a range that starts past the end.
+   ["-d:" "-f1-" "wide"] ["-d:" "-f9-" "wide"]
+   ;; A field past the end inside a list is SKIPPED, not an error, and does
+   ;; not produce a stray delimiter.
+   ["-d:" "-f2,9" "wide"] ["-d:" "-f4,5" "short"]
+   ;; A DESCENDING range selects nothing -- and still prints a line.
+   ["-d:" "-f3-1" "wide"]
+   ;; A list over a line with no delimiter still prints the whole line.
+   ["-d:" "-f1,3" "nosep"]
+   ;; A list over the empty and the multi-byte fixtures.
+   ["-d:" "-f1,3" "utf8"] ["-d:" "-f1,3" "empty"]
+   ;; Malformed lists: two different diagnostics and exit 1, compared as
+   ;; bytes like every other case. `0` and the empty list are "may not
+   ;; include zero"; a non-number and a second dash are "illegal list
+   ;; value". Before this the command had ONE message, spelled `[-cf]`
+   ;; where cut spells it `[-bcf]`, and no case exercised it at all.
+   ["-d:" "-f0" "wide"] ["-d:" "-fx" "wide"] ["-d:" "-f1-x" "wide"]
+   ["-d:" "-f1-2-3" "wide"] ["-d:" "-f1," "wide"] ["-d:" "-f,1" "wide"]
+   ["-d:" "-f-" "wide"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")

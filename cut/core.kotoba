@@ -59,10 +59,6 @@ b" 1 2))
     (let [d (digit-value s i)]
       (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
 
-(defn parse-count [s :string] :i64
-  (let [n (string-byte-length s)]
-    (if (= n 0) -1 (text->i64 s 0 n 0))))
-
 ;; --- argument shapes -----------------------------------------------------
 ;; `cut -fN FILE`      -> 2 arguments
 ;; `cut -dX -fN FILE`  -> 3 arguments
@@ -80,6 +76,106 @@ b" 1 2))
 
 (defn path-arg [] :string
   (if (dashed?) (arg "2") (arg "1")))
+
+;; --- the field list ------------------------------------------------------
+;;
+;; `-f` takes a LIST, not a number: `-f2,4`, `-f2-4`, `-f2-`, `-f-3`, and any
+;; comma-separated mixture. Measured against /usr/bin/cut 2026-09-10, the
+;; list behaves as a SET tested per field rather than a sequence to walk:
+;;
+;;   -f3,1  -> a:c    the output is ASCENDING, not the order written
+;;   -f1,1  -> a      a repeat selects the field once
+;;   -f2,9  -> b      a field past the end is skipped, not an error
+;;   -f3-1  -> (empty line, exit 0)   a descending range selects nothing
+;;
+;; So this asks "is field n selected" for n = 1, 2, ... in order. Ascending
+;; order, de-duplication and out-of-range skipping all fall out of that; none
+;; of them needs a sort, which is fortunate because there is no ordering
+;; primitive to sort with.
+
+;; Non-empty and every byte a digit.
+(defn all-digits? [s :string i :i64 n :i64] :i64
+  (if (= n 0)
+    0
+    (if (>= i n)
+      1
+      (if (< (digit-value s i) 0) 0 (all-digits? s (+ i 1) n)))))
+
+;; 0 = well formed, 1 = illegal list value, 2 = value may not include zero.
+;; An EMPTY item is 2, not 1: measured, `-f1,` and `-f,1` and `-f` all report
+;; "values may not include zero", because an absent number reads as 0. A
+;; range with both sides absent (`-f-`) is 2 for the same reason -- while
+;; `-f1-` and `-f-1` are both well formed, since there an absent side means
+;; unbounded rather than zero.
+(defn classify-item [item :string] :i64
+  (let [n (string-byte-length item)
+        d (string-index-of item "-")]
+    (if (= n 0)
+      2
+      (if (< d 0)
+        (if (= (all-digits? item 0 n) 1)
+          (if (= (text->i64 item 0 n 0) 0) 2 0)
+          1)
+        (let [lo (string-substring item 0 d)
+              hi (string-substring item (+ d 1) n)
+              ln (string-byte-length lo)
+              hn (string-byte-length hi)]
+          (if (>= (string-index-of hi "-") 0)
+            1
+            (if (= (+ ln hn) 0)
+              2
+              (if (= ln 0)
+                (if (= (all-digits? hi 0 hn) 1)
+                  (if (= (text->i64 hi 0 hn 0) 0) 2 0)
+                  1)
+                (if (= hn 0)
+                  (if (= (all-digits? lo 0 ln) 1)
+                    (if (= (text->i64 lo 0 ln 0) 0) 2 0)
+                    1)
+                  (if (= (all-digits? lo 0 ln) 1)
+                    (if (= (all-digits? hi 0 hn) 1)
+                      (if (= (text->i64 lo 0 ln 0) 0)
+                        2
+                        (if (= (text->i64 hi 0 hn 0) 0) 2 0))
+                      1)
+                    1))))))))))
+
+;; The first item that is not well formed decides, scanning left to right.
+(defn classify-spec [spec :string] :i64
+  (let [n (string-byte-length spec)
+        i (string-index-of spec ",")]
+    (if (< i 0)
+      (classify-item spec)
+      (let [c (classify-item (string-substring spec 0 i))]
+        (if (= c 0)
+          (classify-spec (string-substring spec (+ i 1) n))
+          c)))))
+
+;; An absent low bound is 1; an absent high bound is unbounded, carried here
+;; as 0 because a real bound can never be 0 (classify-spec rejected it).
+(defn item-selects? [item :string n :i64] :i64
+  (let [len (string-byte-length item)
+        d (string-index-of item "-")]
+    (if (< d 0)
+      (if (= (text->i64 item 0 len 0) n) 1 0)
+      (let [lo (string-substring item 0 d)
+            hi (string-substring item (+ d 1) len)
+            ln (string-byte-length lo)
+            hn (string-byte-length hi)
+            lov (if (= ln 0) 1 (text->i64 lo 0 ln 0))
+            hiv (if (= hn 0) 0 (text->i64 hi 0 hn 0))]
+        (if (< n lov)
+          0
+          (if (= hiv 0) 1 (if (<= n hiv) 1 0)))))))
+
+(defn spec-selects? [spec :string n :i64] :i64
+  (let [len (string-byte-length spec)
+        i (string-index-of spec ",")]
+    (if (< i 0)
+      (item-selects? spec n)
+      (if (= (item-selects? (string-substring spec 0 i) n) 1)
+        1
+        (spec-selects? (string-substring spec (+ i 1) len) n)))))
 
 ;; --- the field walk ------------------------------------------------------
 
@@ -104,37 +200,86 @@ b" 1 2))
                                      (string-byte-length line))
                    d (- n 1))))))
 
-;; A line that HAS the delimiter but too few fields answers the empty string,
-;; which is different from a line that has none at all.
-(defn field-of [line :string d :string n :i64] :string
-  (if (< (string-index-of line d) 0)
-    line
-    (nth-field line d n)))
+;; How many fields the line has: one more than the number of delimiters.
+(defn field-count [line :string d :string acc :i64] :i64
+  (let [i (string-index-of line d)]
+    (if (< i 0)
+      acc
+      (field-count (string-substring line (+ i (string-byte-length d))
+                                     (string-byte-length line))
+                   d (+ acc 1)))))
 
-(defn walk [rest :string d :string n :i64] :i64
+;; The selected fields are joined by the delimiter, which means the separator
+;; goes BETWEEN them and not before the first. Carrying a "have I written
+;; anything yet" flag alongside line, delimiter, spec, index and total would
+;; be six parameters, and the compiler admits five
+;; (`kotoba.compiler.frontend/max-parameters`, an ABI arity limit rather than
+;; a language decision -- if it moves, this splits back into one function).
+;; So the first selected field is found first and written bare, and every
+;; later one is written WITH a leading delimiter. No flag needed.
+
+;; The first selected field at or after n, or 0 when there is none.
+(defn first-selected [spec :string n :i64 total :i64] :i64
+  (if (> n total)
+    0
+    (if (= (spec-selects? spec n) 1) n (first-selected spec (+ n 1) total))))
+
+(defn emit-rest [line :string d :string spec :string n :i64 total :i64] :i64
+  (if (> n total)
+    0
+    (do
+      (if (= (spec-selects? spec n) 1)
+        (do (emit d) (emit (nth-field line d n)))
+        "")
+      (emit-rest line d spec (+ n 1) total))))
+
+(defn emit-fields [line :string d :string spec :string total :i64] :i64
+  (let [f (first-selected spec 1 total)]
+    (if (= f 0)
+      0
+      (do
+        (emit (nth-field line d f))
+        (emit-rest line d spec (+ f 1) total)))))
+
+;; A line with NO delimiter at all is printed WHOLE, whatever the list says
+;; -- measured: `cut -d: -f1,3` over `nofield` answers `nofield`. That is a
+;; different question from a line that has the delimiter but too few fields,
+;; which contributes nothing.
+(defn emit-line [line :string d :string spec :string] :i64
+  (if (< (string-index-of line d) 0)
+    (do (emit line) 0)
+    (emit-fields line d spec (field-count line d 1))))
+
+(defn walk [rest :string d :string spec :string] :i64
   (let [i (string-index-of rest "\n")]
     (if (< i 0)
       (if (= (string-byte-length rest) 0)
         0
-        (do (emit (field-of rest d n)) (emit (nl)) 0))
+        (do (emit-line rest d spec) (emit (nl)) 0))
       (do
-        (emit (field-of (string-substring rest 0 i) d n))
+        (emit-line (string-substring rest 0 i) d spec)
         (emit (nl))
-        (walk (string-substring rest (+ i 1) (string-byte-length rest)) d n)))))
+        (walk (string-substring rest (+ i 1) (string-byte-length rest)) d spec)))))
 
 (defn main [] :i64
-  (let [n (parse-count (field-text))
-        path (path-arg)]
-    (if (< n 1)
+  (let [spec (field-text)
+        path (path-arg)
+        bad (classify-spec spec)]
+    (if (= bad 1)
       (do
-        (emit-error "cut: [-cf] list: illegal list value")
+        (emit-error "cut: [-bcf] list: illegal list value")
         (emit-error (nl))
         1)
-      (if (readable? path)
-        (walk (slurp-file path) (delim) n)
+      (if (= bad 2)
         (do
-          (emit-error "cut: ")
-          (emit-error path)
-          (emit-error ": No such file or directory")
+          (emit-error "cut: [-bcf] list: values may not include zero")
           (emit-error (nl))
-          1)))))
+          1)
+        (if (readable? path)
+          (walk (slurp-file path) (delim) spec)
+          (do
+            (emit-error "cut: ")
+            (emit-error path)
+            (emit-error ": No such file or directory")
+            (emit-error (nl))
+            1))))))

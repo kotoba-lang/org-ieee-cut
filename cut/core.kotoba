@@ -60,10 +60,14 @@ b" 1 2))
       (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
 
 ;; --- argument shapes -----------------------------------------------------
-;; `cut -fN FILE`      -> 2 arguments
-;; `cut -dX -fN FILE`  -> 3 arguments
+;; `cut -fLIST FILE...` or `cut -dX -fLIST FILE...`.
+;;
+;; This asked whether the argument COUNT was 3 until 2026-09-10, which was
+;; right for exactly one operand and wrong for any other number: with two
+;; files `cut -f1 a b` counts 3 and would have been read as carrying a `-d`.
+;; The question is about argument 0's SHAPE, so that is what it now asks.
 (defn dashed? [] :bool
-  (string=? (arg "") "3"))
+  (= (string-index-of (arg "0") "-d") 0))
 
 (defn delim [] :string
   (if (dashed?)
@@ -74,8 +78,17 @@ b" 1 2))
   (let [a (if (dashed?) (arg "1") (arg "0"))]
     (string-substring a 2 (string-byte-length a))))
 
-(defn path-arg [] :string
-  (if (dashed?) (arg "2") (arg "1")))
+(defn first-file [] :i64
+  (if (dashed?) 2 1))
+
+(defn digit-text [d :i64] :string
+  (string-substring "0123456789" d (+ d 1)))
+
+(defn decimal-of [n :i64] :string
+  (if (< n 10)
+    (digit-text n)
+    (string-concat (decimal-of (quot n 10))
+                   (digit-text (- n (* 10 (quot n 10)))))))
 
 ;; --- the field list ------------------------------------------------------
 ;;
@@ -250,20 +263,66 @@ b" 1 2))
     (do (emit line) 0)
     (emit-fields line d spec (field-count line d 1))))
 
+;; A last line with NO trailing newline: cut adds one when it EXTRACTED a
+;; field and does not when it echoed an undelimited line whole. Measured
+;; 2026-09-10 -- `cut -d: -f1` over `nonl-x:nonl-y` answers `nonl-x\n` (7
+;; bytes) and over `g` answers `g` (1 byte, no newline).
+;;
+;; The single-operand suite could not see this: every undelimited fixture
+;; ended in a newline. It surfaced only once two operands were compared,
+;; because the missing terminator makes the NEXT operand's output look as
+;; though it ran on.
 (defn walk [rest :string d :string spec :string] :i64
   (let [i (string-index-of rest "\n")]
     (if (< i 0)
       (if (= (string-byte-length rest) 0)
         0
-        (do (emit-line rest d spec) (emit (nl)) 0))
+        (do (emit-line rest d spec)
+            (if (>= (string-index-of rest d) 0) (emit (nl)) "")
+            0))
       (do
         (emit-line (string-substring rest 0 i) d spec)
         (emit (nl))
         (walk (string-substring rest (+ i 1) (string-byte-length rest)) d spec)))))
 
+(defn complain [path :string] :i64
+  (do
+    (emit-error "cut: ")
+    (emit-error path)
+    (emit-error ": No such file or directory")
+    (emit-error (nl))
+    1))
+
+;; --- several operands ----------------------------------------------------
+;;
+;; Each operand is cut on its own, exactly as sort reads each of its own
+;; operands as lines. There are no headers, so the outputs simply follow one
+;; another.
+;;
+;; What makes two operands look like one byte stream is the rule above, not
+;; concatenation. Measured 2026-09-10, with `g` holding one undelimited and
+;; unterminated line:
+;;
+;;   cut -d: -f1 g colon   ->  ga / d      `g` had no newline, so `a` follows it
+;;   cut -d: -f1 nl2 colon ->  nonl-x / a / d   a field WAS cut, so it did
+;;
+;; The first of those was read as "cut concatenates its operands" for about
+;; an hour. It does not; the previous operand's output was simply
+;; unterminated. The two cases together are what distinguish the models, and
+;; both are in the suite.
+(defn each [i :i64 total :string spec :string worst :i64] :i64
+  (if (string=? (decimal-of i) total)
+    worst
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (do (walk (slurp-file path) (delim) spec)
+            (each (+ i 1) total spec worst))
+        (do (complain path) (each (+ i 1) total spec 1))))))
+
 (defn main [] :i64
   (let [spec (field-text)
-        path (path-arg)
+        total (arg "")
+        start (first-file)
         bad (classify-spec spec)]
     (if (= bad 1)
       (do
@@ -275,11 +334,9 @@ b" 1 2))
           (emit-error "cut: [-bcf] list: values may not include zero")
           (emit-error (nl))
           1)
-        (if (readable? path)
-          (walk (slurp-file path) (delim) spec)
-          (do
-            (emit-error "cut: ")
-            (emit-error path)
-            (emit-error ": No such file or directory")
-            (emit-error (nl))
-            1))))))
+        ;; `start` already at the end means there is no file operand. POSIX
+        ;; reads standard input; there is no stdin capability, so this
+        ;; refuses rather than pretending to have read an empty one.
+        (if (string=? (decimal-of start) total)
+          1
+          (each start total spec 0))))))

@@ -56,6 +56,15 @@
    ;; field.
    "edges"  ":lead\ntrail:\n"
    "utf8"   "\u65e5:\u672c:\u8a9e\n"
+   ;; No trailing newline, WITH a delimiter: cut extracts a field and adds a
+   ;; newline, 13 bytes in and 7 out.
+   "nonl"   "nonl-x:nonl-y"
+   ;; No trailing newline and NO delimiter: cut echoes the line whole and
+   ;; adds NOTHING, 1 byte in and 1 out. This is the fixture the
+   ;; single-operand suite never had -- every undelimited case ended in a
+   ;; newline -- and without it the two-operand run-on looks like proof that
+   ;; cut concatenates its inputs, which it does not.
+   "bare"   "g"
    ;; Five fields, so ranges have room on both sides.
    "wide"   "a:b:c:d:e\n"})
 
@@ -94,7 +103,31 @@
    ;; where cut spells it `[-bcf]`, and no case exercised it at all.
    ["-d:" "-f0" "wide"] ["-d:" "-fx" "wide"] ["-d:" "-f1-x" "wide"]
    ["-d:" "-f1-2-3" "wide"] ["-d:" "-f1," "wide"] ["-d:" "-f,1" "wide"]
-   ["-d:" "-f-" "wide"]])
+   ["-d:" "-f-" "wide"]
+   ;; --- two or more operands ------------------------------------------
+   ;; cut CONCATENATES and cuts the result; there are no headers.
+   ["-d:" "-f1" "colon" "short"] ["-d:" "-f2" "colon" "short"]
+   ["-d:" "-f1,3" "colon" "wide"]
+   ;; The same file twice is not de-duplicated.
+   ["-d:" "-f1" "colon" "colon"]
+   ;; An empty operand contributes nothing.
+   ["-d:" "-f1" "colon" "empty"] ["-d:" "-f1" "empty" "colon"]
+   ;; THE contrast with sort. `nonl` has no trailing newline, and cut runs
+   ;; it into the next operand's first line where sort keeps it whole.
+   ["-d:" "-f1" "nonl" "colon"] ["-d:" "-f1" "colon" "nonl"]
+   ;; A missing operand: the readable ones are still cut and printed, and
+   ;; the exit status is 1 -- cut continues where sort refuses outright.
+   ["-d:" "-f1" "colon" "missing"] ["-d:" "-f1" "missing" "colon"]
+   ["-d:" "-f1" "colon" "missing" "short"]
+   ;; No -d, so the delimiter is a TAB, across two operands.
+   ["-f1" "tabs" "colon"]
+   ;; The pair that distinguishes "cut concatenates its operands" from "cut
+   ;; leaves an undelimited last line unterminated". Alone, `bare` must come
+   ;; back as ONE byte with no newline; followed by another operand, that
+   ;; operand's first field lands on the same line -- which looks like
+   ;; concatenation and is not.
+   ["-d:" "-f1" "bare"] ["-d:" "-f1" "bare" "colon"]
+   ["-d:" "-f2" "bare" "colon"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")

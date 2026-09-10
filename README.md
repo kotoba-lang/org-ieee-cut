@@ -124,6 +124,31 @@ operands made visible.
 An unreadable operand is reported and the readable ones are still cut and
 printed, with exit 1 — where `sort` refuses to print anything at all.
 
+## `-s` suppresses exactly the lines cut would echo whole
+
+A line with no delimiter is printed whole — that is the behaviour this README
+opens with — and `-s` is the flag that drops those lines instead. An **empty**
+line has no delimiter either, so `-s` drops it too.
+
+`-s` is about the **delimiter, not the field**: a delimited line that lacks
+the requested field still prints an empty line under `-s`.
+
+Removing the suppression fails **5** cases — exactly those containing an
+undelimited line, while a fully-delimited fixture correctly survives, since
+there is nothing there to suppress. Letting a suppressed line still emit its
+newline fails **3**: otherwise `-s` replaces each dropped line with a blank
+one.
+
+## The flags are scanned, not indexed
+
+`-d: -s -f1`, `-s -d: -f1` and `-d: -f2 -s` are one request. This used to ask
+whether argument 0 began with `-d` and take the operand from a fixed offset —
+a positional assumption that `-s` breaks in three places at once. The
+arguments are now scanned, and a scan has no position to be wrong about.
+
+Restoring fixed offsets fails **11** cases: every `-s` one. That is the
+measure of how load-bearing the change is — it is not tidying.
+
 ## What this is not
 
 No `-c`, `-b`, `-s`, `-n`, no reading standard input — with no file operand

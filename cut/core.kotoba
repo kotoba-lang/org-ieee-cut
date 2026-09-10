@@ -59,28 +59,14 @@ b" 1 2))
     (let [d (digit-value s i)]
       (if (< d 0) -1 (text->i64 s (+ i 1) n (+ (* acc 10) d))))))
 
-;; --- argument shapes -----------------------------------------------------
-;; `cut -fLIST FILE...` or `cut -dX -fLIST FILE...`.
+;; --- arguments ------------------------------------------------------------
+;; `cut [-dX] [-s] -fLIST FILE...`, and the flags may come in ANY order --
+;; measured, `-d: -s -f1`, `-s -d: -f1` and `-d: -f2 -s` are the same request.
 ;;
-;; This asked whether the argument COUNT was 3 until 2026-09-10, which was
-;; right for exactly one operand and wrong for any other number: with two
-;; files `cut -f1 a b` counts 3 and would have been read as carrying a `-d`.
-;; The question is about argument 0's SHAPE, so that is what it now asks.
-(defn dashed? [] :bool
-  (= (string-index-of (arg "0") "-d") 0))
-
-(defn delim [] :string
-  (if (dashed?)
-    (string-substring (arg "0") 2 (string-byte-length (arg "0")))
-    (tab)))
-
-(defn field-text [] :string
-  (let [a (if (dashed?) (arg "1") (arg "0"))]
-    (string-substring a 2 (string-byte-length a))))
-
-(defn first-file [] :i64
-  (if (dashed?) 2 1))
-
+;; So the arguments are SCANNED rather than indexed. This used to ask whether
+;; argument 0 began with `-d` and take the operand from a fixed offset, which
+;; is a positional assumption that `-s` breaks in three different places at
+;; once. A scan has no position to be wrong about.
 (defn digit-text [d :i64] :string
   (string-substring "0123456789" d (+ d 1)))
 
@@ -89,6 +75,44 @@ b" 1 2))
     (digit-text n)
     (string-concat (decimal-of (quot n 10))
                    (digit-text (- n (* 10 (quot n 10)))))))
+
+(defn dash? [a :string] :bool
+  (= (string-index-of a "-") 0))
+
+;; The index of the first argument that is not a flag.
+(defn first-file-from [i :i64 total :string] :i64
+  (if (string=? (decimal-of i) total)
+    i
+    (if (dash? (arg (decimal-of i)))
+      (first-file-from (+ i 1) total)
+      i)))
+
+(defn first-file [] :i64
+  (first-file-from 0 (arg "")))
+
+;; The flag beginning with PREFIX, or "" -- searched among the leading flags
+;; only, so a FILE named `-f...` is never mistaken for one.
+(defn flag-from [i :i64 stop :i64 prefix :string] :string
+  (if (>= i stop)
+    ""
+    (let [a (arg (decimal-of i))]
+      (if (= (string-index-of a prefix) 0)
+        a
+        (flag-from (+ i 1) stop prefix)))))
+
+(defn has-flag? [name :string] :bool
+  (string=? (flag-from 0 (first-file) name) name))
+
+(defn suppress? [] :bool
+  (has-flag? "-s"))
+
+(defn delim [] :string
+  (let [d (flag-from 0 (first-file) "-d")]
+    (if (string=? d "") (tab) (string-substring d 2 (string-byte-length d)))))
+
+(defn field-text [] :string
+  (let [f (flag-from 0 (first-file) "-f")]
+    (if (string=? f "") "" (string-substring f 2 (string-byte-length f)))))
 
 ;; --- the field list ------------------------------------------------------
 ;;
@@ -258,9 +282,12 @@ b" 1 2))
 ;; -- measured: `cut -d: -f1,3` over `nofield` answers `nofield`. That is a
 ;; different question from a line that has the delimiter but too few fields,
 ;; which contributes nothing.
+;; -s suppresses exactly the lines this echoes whole: those with no
+;; delimiter. Measured -- an EMPTY line has no delimiter either, so `-s` drops
+;; it too, which is why the fixtures include one.
 (defn emit-line [line :string d :string spec :string] :i64
   (if (< (string-index-of line d) 0)
-    (do (emit line) 0)
+    (if (suppress?) 0 (do (emit line) 0))
     (emit-fields line d spec (field-count line d 1))))
 
 ;; A last line with NO trailing newline: cut adds one when it EXTRACTED a
@@ -282,7 +309,13 @@ b" 1 2))
             0))
       (do
         (emit-line (string-substring rest 0 i) d spec)
-        (emit (nl))
+        ;; A suppressed line contributes no newline either -- otherwise -s
+        ;; would replace each dropped line with a blank one.
+        (if (if (suppress?)
+              (< (string-index-of (string-substring rest 0 i) d) 0)
+              false)
+          ""
+          (emit (nl)))
         (walk (string-substring rest (+ i 1) (string-byte-length rest)) d spec)))))
 
 (defn complain [path :string] :i64

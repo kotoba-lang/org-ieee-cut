@@ -127,7 +127,22 @@
    ;; operand's first field lands on the same line -- which looks like
    ;; concatenation and is not.
    ["-d:" "-f1" "bare"] ["-d:" "-f1" "bare" "colon"]
-   ["-d:" "-f2" "bare" "colon"]])
+   ["-d:" "-f2" "bare" "colon"]
+   ;; --- -s suppresses lines with no delimiter ---------------------------
+   ;; Exactly the lines cut otherwise echoes WHOLE. An empty line has no
+   ;; delimiter either, so -s drops it too.
+   ["-d:" "-s" "-f1" "colon"] ["-d:" "-s" "-f1" "nosep"]
+   ["-d:" "-s" "-f1" "edges"] ["-d:" "-s" "-f1" "empty"]
+   ;; A delimited line missing the field still prints an empty line under -s;
+   ;; -s is about the DELIMITER, not about the field.
+   ["-d:" "-s" "-f9" "colon"] ["-d:" "-s" "-f4" "short"]
+   ;; The flags may come in ANY order -- all three of these are one request.
+   ["-s" "-d:" "-f1" "colon"] ["-d:" "-f1" "-s" "colon"]
+   ;; -s with the TAB default, and across several operands.
+   ["-s" "-f1" "tabs"] ["-s" "-f1" "colon"]
+   ["-d:" "-s" "-f1" "colon" "nosep"]
+   ;; -s over the unterminated undelimited fixture: dropped entirely.
+   ["-d:" "-s" "-f1" "bare"] ["-d:" "-s" "-f1" "bare" "colon"]])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")

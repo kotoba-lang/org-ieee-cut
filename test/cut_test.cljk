@@ -1,4 +1,4 @@
-;; test/cut_test.cljs — build the command and compare it with the system
+;; test/cut_test.cljk — build the command and compare it with the system
 ;; cut, byte for byte, on stdout, stderr AND exit status.
 ;;
 ;; Two behaviours carry most of the weight here and neither is an edge case:

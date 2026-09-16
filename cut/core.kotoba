@@ -2,6 +2,7 @@
 ;;
 ;;   cut -f N FILE        field N, delimited by TAB
 ;;   cut -dX -fN FILE     field N, delimited by X
+;;   ... | cut ...        the same over standard input (wire 41)
 ;;
 ;; ## A line with no delimiter is printed WHOLE
 ;;
@@ -35,6 +36,10 @@
 
 (defn slurp-file [path :string] :string
   (typed-cap-call :fs/app-data :string :string path))
+
+;; Wire 41: the empty request answers standard input to EOF.
+(defn stdin [n :string] :string
+  (typed-cap-call :io/read :string :string n))
 
 (defn readable? [path :string] :bool
   (string=? (typed-cap-call :fs/app-data :string :string
@@ -604,9 +609,10 @@
           (emit-error "cut: [-bcf] list: values may not include zero")
           (emit-error (nl))
           1)
-        ;; `start` already at the end means there is no file operand. POSIX
-        ;; reads standard input; there is no stdin capability, so this
-        ;; refuses rather than pretending to have read an empty one.
+        ;; `start` already at the end means there is no file operand:
+        ;; standard input, whole (wire 41, 2026-09-16 -- 97% of cut's
+        ;; invocations in agent tool use are a later pipeline segment).
+        ;; Input past the string pool is refused, never cut short.
         (if (string=? (decimal-of start) total)
-          1
+          (do (walk (stdin "") (delim) (spec->cfg spec (suppress?) (delim))) 0)
           (each start total (spec->cfg spec (suppress?) (delim)) 0))))))

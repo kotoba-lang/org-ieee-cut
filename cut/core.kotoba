@@ -339,8 +339,8 @@ b" 1 2))
 ;; delimiter found by `string-index-of`, or 0, or the length; nothing else
 ;; is a code-point boundary and a substring off one traps.
 ;;
-;; The BUDGET is the handle bound: a field costs up to four handles (its
-;; search view, its view, its delimiter's and its own append), and a line
+;; The BUDGET is the handle bound: a field costs up to three handles (its
+;; view, its delimiter's and its own append; the search cuts none), and a line
 ;; of thousands of fields would exhaust the loader's default 4,096 inside
 ;; one region. So a line is cut on the batch's accumulator only for its
 ;; first 256 fields; past that the accumulator is written and the REST of
@@ -371,9 +371,10 @@ b" 1 2))
 ;; delimiter: `end * 2 + 1` when a delimiter ended it, `n * 2` when the
 ;; line did.
 (defn field-end [line :string d :string pos :i64] :i64
-  (let [n (string-byte-length line)
-        i (string-index-of (string-substring line pos n) d)]
-    (if (< i 0) (* n 2) (+ (* (+ pos i) 2) 1))))
+  ;; One host search from POS (`string-index-of-from`, context ABI v8): no
+  ;; view is cut per field, which halves the handles a field costs.
+  (let [i (string-index-of-from line d pos)]
+    (if (< i 0) (* (string-byte-length line) 2) (+ (* i 2) 1))))
 
 ;; SEL: 0 not selected, 1 selected and first, 2 selected after another.
 (defn append-selected [line :string pos :i64 end :i64 sel :i64 acc :string] :string
@@ -460,8 +461,8 @@ b" 1 2))
       (do (emit acc) n)
       (if (>= consumed 1024)
         (do (emit acc) pos)
-        (let [i (string-index-of (string-substring text pos n) (nl))
-              end (if (< i 0) n (+ pos i))
+        (let [i (arena-scope (string-index-of-from text (nl) pos))
+              end (if (< i 0) n i)
               next (if (< i 0) n (+ end 1))]
           (batch text d cfg (+ (i64-shift-left next 22) (+ consumed (- next pos)))
                  (cut-fields (string-substring text pos end) d (pack-pk 0 1 255 (< i 0)) cfg acc)))))))

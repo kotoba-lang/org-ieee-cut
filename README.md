@@ -110,11 +110,13 @@ lines, `-d' '`:
 | `-s -f2` | 0.19 | — | 0.03 | — |
 | `-f1,1,5,60` | 0.65 | 9.75 | 0.14 | — |
 
-What remains per line is about eight host calls — two per field for the
-search view and the field's view, two for the line — so a list naming a
-field above 40 (asked of the list itself, per field, `-f60` above) and a
-list reaching every field (`-f3-`) pay in proportion. A search that
-takes a start offset instead of a view is the next lever.
+What remains per line is about six host calls — one search per field
+(`string-index-of-from`, context ABI v8, from an offset with no view cut)
+and the field's view, one search and a view for the line, the appends —
+so a list naming a field above 40 (asked of the list itself, per field,
+`-f60` above) and a list reaching every field (`-f3-`) pay in proportion.
+Dropping the search views (ABI v7 → v8) did not move `-f2` at all: the
+cost is the calls, about 30 ns each over a 33 MB text, not the handles.
 
 ## Five parameters
 

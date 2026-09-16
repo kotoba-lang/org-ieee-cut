@@ -214,109 +214,265 @@ b" 1 2))
         1
         (spec-selects? (string-substring spec (+ i 1) len) n)))))
 
-;; --- the field walk ------------------------------------------------------
-
-;; The nth field of LINE, or the WHOLE line when the delimiter does not occur
-;; in it, or the empty string when the line has fewer fields than n.
-(defn nth-field [line :string d :string n :i64] :string
-  (let [i (string-index-of line d)]
-    (if (< i 0)
-      ;; Out of delimiters. At n = 1 the remainder IS the last field; past it
-      ;; the line has fewer fields than were asked for and the answer is
-      ;; empty.
-      ;;
-      ;; Returning the remainder here instead was wrong in a way only one
-      ;; case showed: `-f4` over a three-field line answered `c` where cut
-      ;; answers nothing, and `-f1` `-f2` `-f3` all agreed. The line with NO
-      ;; delimiter at all is a different question, and `field-of` below asks
-      ;; it before this walk starts.
-      (if (= n 1) line "")
-      (if (= n 1)
-        (string-substring line 0 i)
-        (nth-field (string-substring line (+ i (string-byte-length d))
-                                     (string-byte-length line))
-                   d (- n 1))))))
-
-;; How many fields the line has: one more than the number of delimiters.
-(defn field-count [line :string d :string acc :i64] :i64
-  (let [i (string-index-of line d)]
-    (if (< i 0)
-      acc
-      (field-count (string-substring line (+ i (string-byte-length d))
-                                     (string-byte-length line))
-                   d (+ acc 1)))))
-
-;; The selected fields are joined by the delimiter, which means the separator
-;; goes BETWEEN them and not before the first. Carrying a "have I written
-;; anything yet" flag alongside line, delimiter, spec, index and total would
-;; be six parameters, and the compiler admits five
-;; (`kotoba.compiler.frontend/max-parameters`, an ABI arity limit rather than
-;; a language decision -- if it moves, this splits back into one function).
-;; So the first selected field is found first and written bare, and every
-;; later one is written WITH a leading delimiter. No flag needed.
-
-;; The first selected field at or after n, or 0 when there is none.
-(defn first-selected [spec :string n :i64 total :i64] :i64
-  (if (> n total)
-    0
-    (if (= (spec-selects? spec n) 1) n (first-selected spec (+ n 1) total))))
-
-(defn emit-rest [line :string d :string spec :string n :i64 total :i64] :i64
-  (if (> n total)
-    0
-    (do
-      (if (= (spec-selects? spec n) 1)
-        (do (emit d) (emit (nth-field line d n)))
-        "")
-      (emit-rest line d spec (+ n 1) total))))
-
-(defn emit-fields [line :string d :string spec :string total :i64] :i64
-  (let [f (first-selected spec 1 total)]
-    (if (= f 0)
-      0
-      (do
-        (emit (nth-field line d f))
-        (emit-rest line d spec (+ f 1) total)))))
-
-;; A line with NO delimiter at all is printed WHOLE, whatever the list says
-;; -- measured: `cut -d: -f1,3` over `nofield` answers `nofield`. That is a
-;; different question from a line that has the delimiter but too few fields,
-;; which contributes nothing.
-;; -s suppresses exactly the lines this echoes whole: those with no
-;; delimiter. Measured -- an EMPTY line has no delimiter either, so `-s` drops
-;; it too, which is why the fixtures include one.
-(defn emit-line [line :string d :string spec :string] :i64
-  (if (< (string-index-of line d) 0)
-    (if (suppress?) 0 (do (emit line) 0))
-    (emit-fields line d spec (field-count line d 1))))
-
-;; A last line with NO trailing newline: cut adds one when it EXTRACTED a
-;; field and does not when it echoed an undelimited line whole. Measured
-;; 2026-09-10 -- `cut -d: -f1` over `nonl-x:nonl-y` answers `nonl-x\n` (7
-;; bytes) and over `g` answers `g` (1 byte, no newline).
+;; --- the field list as a bit set ----------------------------------------
 ;;
-;; The single-operand suite could not see this: every undelimited fixture
-;; ended in a newline. It surfaced only once two operands were compared,
-;; because the missing terminator makes the NEXT operand's output look as
-;; though it ran on.
-(defn walk [rest :string d :string spec :string] :i64
-  (let [i (string-index-of rest "\n")]
+;; The list is parsed ONCE into an i64 (2026-09-16):
+;;
+;;   bit 0        -s
+;;   bits 1-40    field k selected, for k <= 40
+;;   bit 41       the list names a bounded field above 40, so a field
+;;                above 40 is asked of the list itself (`spec-selects?`)
+;;   bit 42       the list has an open range `N-`
+;;   bits 43-62   N of the smallest open range when bit 42 is set; else the
+;;                LAST selected field, past which the walk stops reading
+;;
+;; Until then every field of every line re-parsed the list (`spec-selects?`
+;; above, a dozen string operations per field) and every line was walked
+;; twice -- once to count its fields, once to cut them -- which was 1.6 s
+;; of a 33 MB cut where `/usr/bin/cut` spends 0.04. `spec-selects?` stays
+;; as the reference the bit set is measured against in the suite, and as
+;; the answer for a field above 40 when the list names one (bit 41): that
+;; path re-reads the list from the arguments per field and is slow, which
+;; a list like `-f60` pays and `-f2` does not.
+
+(defn cfg-sup? [cfg :i64] :bool (= 1 (bit-and cfg 1)))
+(defn cfg-high? [cfg :i64] :bool (= 1 (bit-and (i64-shift-right cfg 41) 1)))
+(defn cfg-open? [cfg :i64] :bool (= 1 (bit-and (i64-shift-right cfg 42) 1)))
+(defn cfg-high [cfg :i64] :i64 (i64-shift-right cfg 43))
+
+;; The smallest N of an open range, or 0.
+(defn cfg-open [cfg :i64] :i64
+  (if (cfg-open? cfg) (cfg-high cfg) 0))
+
+;; The last selected field when there is no open range, else 0.
+(defn cfg-last [cfg :i64] :i64
+  (if (cfg-open? cfg) 0 (cfg-high cfg)))
+
+;; The high twenty bits replaced, the rest kept.
+(defn with-high [cfg :i64 n :i64] :i64
+  (+ (bit-and cfg 8796093022207) (i64-shift-left n 43)))
+
+(defn with-open [cfg :i64 n :i64] :i64
+  (let [o (cfg-open cfg)]
+    (if (if (= o 0) true (< n o))
+      (bit-or (with-high cfg n) 4398046511104)
+      cfg)))
+
+;; A bounded field: its bit (or the above-40 mark), and the last-field mark
+;; raised to it unless an open range already covers everything past some
+;; point.
+(defn with-field [cfg :i64 v :i64] :i64
+  (let [c (if (> v 40) (bit-or cfg 2199023255552) (bit-or cfg (i64-shift-left 1 v)))]
+    (if (cfg-open? c) c (if (> v (cfg-last c)) (with-high c v) c))))
+
+(defn set-range [cfg :i64 lo :i64 hi :i64] :i64
+  (if (> lo hi)
+    cfg
+    (set-range (with-field cfg lo) (+ lo 1) hi)))
+
+(defn item-cfg [cfg :i64 item :string] :i64
+  (let [len (string-byte-length item)
+        d (string-index-of item "-")]
+    (if (< d 0)
+      (with-field cfg (text->i64 item 0 len 0))
+      (let [lo (string-substring item 0 d)
+            hi (string-substring item (+ d 1) len)
+            ln (string-byte-length lo)
+            hn (string-byte-length hi)
+            lov (if (= ln 0) 1 (text->i64 lo 0 ln 0))
+            hiv (if (= hn 0) 0 (text->i64 hi 0 hn 0))]
+        (if (= hiv 0)
+          (with-open cfg lov)
+          ;; A range wider than the bit set is not enumerated: it is
+          ;; marked above-40 and asked of the list per field.
+          (if (> hiv 40)
+            (with-field (with-field (set-range cfg lov (if (> lov 40) lov 40)) hiv) hiv)
+            (set-range cfg lov hiv)))))))
+
+(defn spec-cfg [cfg :i64 spec :string] :i64
+  (let [len (string-byte-length spec)
+        i (string-index-of spec ",")]
     (if (< i 0)
-      (if (= (string-byte-length rest) 0)
-        0
-        (do (emit-line rest d spec)
-            (if (>= (string-index-of rest d) 0) (emit (nl)) "")
-            0))
-      (do
-        (emit-line (string-substring rest 0 i) d spec)
-        ;; A suppressed line contributes no newline either -- otherwise -s
-        ;; would replace each dropped line with a blank one.
-        (if (if (suppress?)
-              (< (string-index-of (string-substring rest 0 i) d) 0)
-              false)
-          ""
-          (emit (nl)))
-        (walk (string-substring rest (+ i 1) (string-byte-length rest)) d spec)))))
+      (item-cfg cfg spec)
+      (spec-cfg (item-cfg cfg (string-substring spec 0 i))
+                (string-substring spec (+ i 1) len)))))
+
+(defn spec->cfg [spec :string sup :bool] :i64
+  (let [cfg (spec-cfg 0 spec)]
+    (if sup (bit-or cfg 1) cfg)))
+
+;; Is field K selected? The open range first, then the bit set, then --
+;; for a field above 40 when the list names one -- the list itself.
+(defn selected? [cfg :i64 k :i64] :bool
+  (let [o (cfg-open cfg)]
+    (if (if (= o 0) false (>= k o))
+      true
+      (if (> k 40)
+        ;; A region: the list is re-read from the arguments per field, and
+        ;; those handles would otherwise count against the walk's budget.
+        (if (cfg-high? cfg) (arena-scope (= 1 (spec-selects? (field-text) k))) false)
+        (not (= 0 (bit-and cfg (i64-shift-left 1 k))))))))
+
+;; --- the field walk ------------------------------------------------------
+;;
+;; ONE pass over the line, APPENDING to an accumulator rather than writing:
+;; a write is a capability call -- validated, dispatched, its byte count
+;; interned as a string -- and measured 2026-09-16 at about 100 ns each on
+;; a 33 MB file, two per line, where a tail append (`string-concat` onto
+;; the pool's last allocation) is the bytes and nothing else. The batch
+;; driver below writes the accumulator once per KB of input.
+;;
+;; Field K starts at POS; the next delimiter ends it. PK packs the cursor,
+;; the field number, a field BUDGET, whether a field was already written
+;; (so the next selected one gets a delimiter before it) and whether this
+;; is the file's LAST line (unterminated) -- `wrote * 2^62 + pos * 2^31 +
+;; k * 2^11 + budget * 2 + last` (the pool is at most 1 GiB, so a cursor
+;; fits 31 bits) -- because a function carries five parameters. A line
+;; with NO delimiter is printed WHOLE whatever the list says -- measured:
+;; `cut -d: -f1,3` over `nofield` answers `nofield` -- which is the K = 1
+;; search finding none; -s drops it instead. The newline: every
+;; terminated line gets one unless -s dropped it; the last unterminated
+;; line gets one only when fields were cut (measured 2026-09-10, `cut -d:
+;; -f1` over `nonl-x:nonl-y` answers 7 bytes and over `g` answers `g`, 1
+;; byte). The walk stops after the last selected field (`cfg-last`): the
+;; rest of the line is never read. Every offset here is the index of a
+;; delimiter found by `string-index-of`, or 0, or the length; nothing else
+;; is a code-point boundary and a substring off one traps.
+;;
+;; The BUDGET is the handle bound: a field costs up to four handles (its
+;; search view, its view, its delimiter's and its own append), and a line
+;; of thousands of fields would exhaust the loader's default 4,096 inside
+;; one region. So a line is cut on the batch's accumulator only for its
+;; first 256 fields; past that the accumulator is written and the REST of
+;; the line is cut in chunks of 256 fields, each its own region with its
+;; own write (`cut-rest`) -- a region nested in the batch's, whose handles
+;; it does not release, which is why 256: 1 KB of input (under 1,300),
+;; the line's first 256 fields (1,024) and one chunk (1,024) fit. Measured
+;; 2026-09-16 on 50 lines of 3,000 fields, every field selected, under
+;; 4,096 handles.
+(defn pk-pos [pk :i64] :i64 (bit-and (i64-shift-right pk 31) 2147483647))
+(defn pk-wrote? [pk :i64] :bool (= 1 (i64-shift-right pk 62)))
+(defn pk-k [pk :i64] :i64 (bit-and (i64-shift-right pk 11) 1048575))
+(defn pk-budget [pk :i64] :i64 (bit-and (i64-shift-right pk 1) 1023))
+(defn pk-last? [pk :i64] :bool (= 1 (bit-and pk 1)))
+(defn pack-pk [pos :i64 k :i64 budget :i64 last? :bool] :i64
+  (+ (i64-shift-left pos 31) (i64-shift-left k 11) (i64-shift-left budget 1)
+     (if last? 1 0)))
+
+(defn pk-next [pk :i64 end :i64 dlen :i64 wrote? :bool] :i64
+  (+ (pack-pk (+ end dlen) (+ (pk-k pk) 1) (- (pk-budget pk) 1) (pk-last? pk))
+     (if wrote? 4611686018427387904 0)))
+
+(defn pk-reset [pk :i64 end :i64 dlen :i64 wrote? :bool] :i64
+  (+ (pack-pk (+ end dlen) (+ (pk-k pk) 1) 255 (pk-last? pk))
+     (if wrote? 4611686018427387904 0)))
+
+;; The offset just past the end of the field starting at POS, plus the
+;; delimiter: `end * 2 + 1` when a delimiter ended it, `n * 2` when the
+;; line did.
+(defn field-end [line :string d :string pos :i64] :i64
+  (let [n (string-byte-length line)
+        i (string-index-of (string-substring line pos n) d)]
+    (if (< i 0) (* n 2) (+ (* (+ pos i) 2) 1))))
+
+;; SEL: 0 not selected, 1 selected and first, 2 selected after another.
+(defn append-selected [line :string pos :i64 end :i64 sel :i64 acc :string] :string
+  (if (= sel 0)
+    acc
+    (string-concat acc (string-substring line pos end))))
+
+(defn sel-of [cfg :i64 pk :i64] :i64
+  (if (selected? cfg (pk-k pk))
+    (if (pk-wrote? pk) 2 1)
+    0))
+
+;; Fields from PK onto ACC until the line ends, the last selected field is
+;; passed, or the budget runs out -- then the accumulator is written and
+;; the rest goes to `cut-rest`; either way the line's newline is appended
+;; by whichever finishes it.
+(defn cut-fields [line :string d :string pk :i64 cfg :i64 acc :string] :string
+  (let [n (string-byte-length line)
+        pos (pk-pos pk)
+        k (pk-k pk)
+        fe (field-end line d pos)
+        end (i64-shift-right fe 1)
+        delimited? (= 1 (bit-and fe 1))]
+    (if (if (= k 1) (not delimited?) false)
+      (if (cfg-sup? cfg)
+        acc
+        (if (pk-last? pk)
+          (string-concat acc line)
+          (string-concat (string-concat acc line) (nl))))
+      (let [sel (sel-of cfg pk)
+            last (cfg-last cfg)
+            wrote? (if (> sel 0) true (pk-wrote? pk))
+            acc2 (append-selected line pos end sel (if (= sel 2) (string-concat acc d) acc))]
+        (if (if (not delimited?) true (if (= last 0) false (>= k last)))
+          (string-concat acc2 (nl))
+          (if (= (pk-budget pk) 0)
+            (do (emit acc2)
+                (cut-rest line d (pk-reset pk end (string-byte-length d) wrote?) cfg)
+                "")
+            (cut-fields line d (pk-next pk end (string-byte-length d) wrote?) cfg acc2)))))))
+
+;; One chunk of a long line: fields from PK onto a fresh accumulator until
+;; the budget runs out or the line ends, then ONE write. Answers the PK to
+;; continue from, or -1 when the line is done. K is never 1 here, so the
+;; no-delimiter case cannot arise.
+(defn cut-chunk [line :string d :string pk :i64 cfg :i64 acc :string] :i64
+  (let [pos (pk-pos pk)
+        k (pk-k pk)
+        fe (field-end line d pos)
+        end (i64-shift-right fe 1)
+        delimited? (= 1 (bit-and fe 1))
+        sel (sel-of cfg pk)
+        last (cfg-last cfg)
+        wrote? (if (> sel 0) true (pk-wrote? pk))
+        acc2 (append-selected line pos end sel (if (= sel 2) (string-concat acc d) acc))]
+    (if (if (not delimited?) true (if (= last 0) false (>= k last)))
+      (do (emit (string-concat acc2 (nl))) -1)
+      (if (= (pk-budget pk) 0)
+        (do (emit acc2) (pk-reset pk end (string-byte-length d) wrote?))
+        (cut-chunk line d (pk-next pk end (string-byte-length d) wrote?) cfg acc2)))))
+
+(defn cut-rest [line :string d :string pk :i64 cfg :i64] :i64
+  (let [next (arena-scope (cut-chunk line d pk cfg ""))]
+    (if (< next 0) 0 (cut-rest line d next cfg))))
+
+;; The lines from POS, cut onto ACC, until 1 KB of INPUT has been consumed
+;; or the text ends; then ONE write (the loader buffers stdout, so a write
+;; is a copy, not a syscall). Answers the cursor to continue from. Runs
+;; inside a region (arena-scope, context ABI v6): the accumulator, every
+;; search view, line view and field view of the batch are released as it
+;; answers, so a file leaves nothing in the arena. The bound is on INPUT
+;; bytes because that bounds the handles: a field costs at most two and is
+;; at least two bytes with its delimiter, a line at most five more, so 1 KB
+;; of input is under 1,300 handles, and with one line's 256-field budget
+;; (1,024) and one nested chunk's (1,024) on top the batch stays inside the
+;; loader's default 4,096, which the suite packages. Measured 2026-09-16:
+;; 16 KB batches trapped on `-f3-` over a C file at 4,096. PC packs the
+;; cursor and the bytes consumed: `pos * 2^22 + consumed`.
+(defn batch [text :string d :string cfg :i64 pc :i64 acc :string] :i64
+  (let [n (string-byte-length text)
+        pos (i64-shift-right pc 22)
+        consumed (bit-and pc 4194303)]
+    (if (>= pos n)
+      (do (emit acc) n)
+      (if (>= consumed 1024)
+        (do (emit acc) pos)
+        (let [i (string-index-of (string-substring text pos n) (nl))
+              end (if (< i 0) n (+ pos i))
+              next (if (< i 0) n (+ end 1))]
+          (batch text d cfg (+ (i64-shift-left next 22) (+ consumed (- next pos)))
+                 (cut-fields (string-substring text pos end) d (pack-pk 0 1 255 (< i 0)) cfg acc)))))))
+
+(defn walk-from [text :string d :string cfg :i64 pos :i64] :i64
+  (if (>= pos (string-byte-length text))
+    0
+    (walk-from text d cfg (arena-scope (batch text d cfg (i64-shift-left pos 22) "")))))
+
+(defn walk [text :string d :string cfg :i64] :i64
+  (walk-from text d cfg 0))
 
 (defn complain [path :string] :i64
   (do
@@ -343,14 +499,14 @@ b" 1 2))
 ;; an hour. It does not; the previous operand's output was simply
 ;; unterminated. The two cases together are what distinguish the models, and
 ;; both are in the suite.
-(defn each [i :i64 total :string spec :string worst :i64] :i64
+(defn each [i :i64 total :string cfg :i64 worst :i64] :i64
   (if (string=? (decimal-of i) total)
     worst
     (let [path (arg (decimal-of i))]
       (if (readable? path)
-        (do (walk (slurp-file path) (delim) spec)
-            (each (+ i 1) total spec worst))
-        (do (complain path) (each (+ i 1) total spec 1))))))
+        (do (walk (slurp-file path) (delim) cfg)
+            (each (+ i 1) total cfg worst))
+        (do (complain path) (each (+ i 1) total cfg 1))))))
 
 (defn main [] :i64
   (let [spec (field-text)
@@ -372,4 +528,4 @@ b" 1 2))
         ;; refuses rather than pretending to have read an empty one.
         (if (string=? (decimal-of start) total)
           1
-          (each start total spec 0))))))
+          (each start total (spec->cfg spec (suppress?)) 0))))))

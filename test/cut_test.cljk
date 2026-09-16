@@ -188,7 +188,7 @@
       ;; here rather than supplied at run time. Counting words walks one code
       ;; point at a time, so the guest recursion is as long as the file and
       ;; the default 512 fuel counts almost nothing.
-      (doseq [[out extra] [[exe ["--fuel" "50000000" "--pairs" "200000" "--string-pool" "8000000"]]]]
+      (doseq [[out extra] [[exe ["--fuel" "50000000" "--pairs" "4096" "--string-pool" "8000000"]]]]
         (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
                                   "--allow" "35,37,38,39"
                                   "--fs-scope" (.realpathSync fs (.join path tmp "data"))

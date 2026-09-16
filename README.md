@@ -76,15 +76,55 @@ between them fails 18 cases with a leading `:`, and bounding the walk by a
 constant instead of the line's field count fails exactly 4, of which
 `-f2,9 -> b:` is precisely the skipped-field claim.
 
+## One pass per line, one write per KB (2026-09-16)
+
+The list is parsed **once** into an i64 — a bit per field up to 40, the
+last selected field (or the smallest open range) in the high twenty bits,
+`-s` in bit 0 — and each line is walked once, field by field, stopping
+after the last selected field. Until then every field of every line
+re-parsed the list and every line was walked twice (once to count fields,
+once to cut), which was **1.6 s** of a 33 MB cut where `/usr/bin/cut`
+spends 0.04.
+
+Selected fields are **appended** to an accumulator (amu's tail append:
+`string-concat` onto the pool's last allocation costs the bytes and
+nothing else) and the accumulator is written once per KB of input; a
+write is a capability call measured at about 100 ns, and there were two
+per line. Every batch is a region (`arena-scope`, context ABI v6), so its
+views and its accumulator are released when it answers and the suite
+packages the loader's **default 4,096 handles**. A line of thousands of
+fields is cut in chunks of 256 fields, each its own region and write —
+measured on 50 lines of 3,000 fields, every field selected.
+
+Measured 2026-09-16, CPU seconds user, output identical to
+`/usr/bin/cut` and to uutils `cut` (Rust) on a 33 MB C file, 769,400
+lines, `-d' '`:
+
+| list | this cut | this cut, before | uutils `cut` | `/usr/bin/cut` |
+|---|---|---|---|---|
+| `-f2` | **0.19** | 1.58 | 0.03 | 0.04 |
+| `-f1,3` | 0.26 | — | 0.05 | — |
+| `-f2-4` | 0.31 | — | 0.05 | — |
+| `-f9` | 0.42 | — | 0.09 | — |
+| `-f3-` | 0.76 | — | 0.14 | — |
+| `-s -f2` | 0.19 | — | 0.03 | — |
+| `-f1,1,5,60` | 0.65 | 9.75 | 0.14 | — |
+
+What remains per line is about six host calls — one search per field
+(`string-index-of-from`, context ABI v8, from an offset with no view cut)
+and the field's view, one search and a view for the line, the appends —
+so a list naming a field above 40 (asked of the list itself, per field,
+`-f60` above) and a list reaching every field (`-f3-`) pay in proportion.
+Dropping the search views (ABI v7 → v8) did not move `-f2` at all: the
+cost is the calls, about 30 ns each over a 33 MB text, not the handles.
+
 ## Five parameters
 
-The selected fields are joined by the delimiter, so the separator goes
-between them. Carrying a "written anything yet" flag alongside line,
-delimiter, spec, index and total is six parameters, and the compiler admits
-five (`kotoba.compiler.frontend/max-parameters` — an ABI arity limit, not a
-language decision; if it moves, this collapses back into one function). So
-the first selected field is found first and written bare, and every later one
-is written with a leading delimiter. No flag needed.
+A function carries five parameters (`kotoba.compiler.frontend/max-parameters`
+— an ABI arity limit, not a language decision), so the walk packs its
+cursor, field number, handle budget, "written anything yet" flag and
+"last line" flag into one i64 (`pk`), and the batch packs its cursor and
+bytes consumed into another.
 
 ## Capabilities
 

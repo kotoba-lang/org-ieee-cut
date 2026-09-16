@@ -102,7 +102,7 @@ lines, `-d' '`:
 
 | list | this cut | this cut, before | uutils `cut` | `/usr/bin/cut` |
 |---|---|---|---|---|
-| `-f2` | **0.19** | 1.58 | 0.03 | 0.04 |
+| `-f2` | **0.13** | 1.58 | 0.03 | 0.04 |
 | `-f1,3` | 0.26 | — | 0.05 | — |
 | `-f2-4` | 0.31 | — | 0.05 | — |
 | `-f9` | 0.42 | — | 0.09 | — |
@@ -117,6 +117,17 @@ so a list naming a field above 40 (asked of the list itself, per field,
 `-f60` above) and a list reaching every field (`-f3-`) pay in proportion.
 Dropping the search views (ABI v7 → v8) did not move `-f2` at all: the
 cost is the calls, about 30 ns each over a 33 MB text, not the handles.
+
+Context ABI **v10** (2026-09-16) then removed the views themselves: when
+the delimiter is one ASCII byte and no field number needs more than 13
+bits, a line is cut over the text by offsets — the newline and each
+delimiter found as a BYTE (`string-find-byte`, no needle handle, no
+region), each selected field appended as a range (`string-append-range`,
+no view), the delimiter between fields as the byte before the field and
+the newline as the byte at the line's end. Per line: one search per field
+read and one append per field written, nothing else. `-f2` 0.19 → **0.13
+s**, `-f3-` 0.77 → 0.61, `-f9` 0.42 → 0.31 (uutils 0.03 / 0.14 / 0.09). A
+multi-byte delimiter or a field past 8191 takes the general walk above.
 
 ## Five parameters
 

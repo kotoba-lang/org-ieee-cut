@@ -200,10 +200,17 @@ arguments are now scanned, and a scan has no position to be wrong about.
 Restoring fixed offsets fails **11** cases: every `-s` one. That is the
 measure of how load-bearing the change is — it is not tidying.
 
+## Standard input
+
+With no file operand `cut` reads standard input (wire 41 `:io/read`,
+2026-09-16) — 97% of how it is invoked in agent tool use (7,766 of 7,976
+over 1,268,018 measured Bash calls; `head | cut` alone is 1,481). Whole-input
+form: input larger than the binary's string pool is refused (exit 120), never
+cut short.
+
 ## What this is not
 
-No `-c`, `-b`, `-s`, `-n`, no reading standard input — with no file operand
-this exits 1 rather than pretending to have read an empty one. `-d` must be
+No `-c`, `-b`, `-n` (`-s` landed since this was first written). `-d` must be
 joined to its argument (`-d:`), and `-f` to its list (`-f2`).
 
 One malformed spec is classified differently from BSD `cut`: a list with

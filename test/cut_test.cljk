@@ -15,7 +15,7 @@
 
 (defn- run [cmd args opts]
   (let [r (.spawnSync cp cmd (clj->js args)
-                      (clj->js (merge {:encoding "buffer"} opts)))]
+                      (clj->js (merge {:encoding "buffer" :maxBuffer 67108864} opts)))]
     {:status (.-status r) :out (.-stdout r) :err (.-stderr r)}))
 
 (defn- refuse [message]
@@ -142,7 +142,19 @@
    ["-s" "-f1" "tabs"] ["-s" "-f1" "colon"]
    ["-d:" "-s" "-f1" "colon" "nosep"]
    ;; -s over the unterminated undelimited fixture: dropped entirely.
-   ["-d:" "-s" "-f1" "bare"] ["-d:" "-s" "-f1" "bare" "colon"]])
+   ["-d:" "-s" "-f1" "bare"] ["-d:" "-s" "-f1" "bare" "colon"]
+   ;; --- standard input (wire 41, 2026-09-16) ---------------------------
+   ;; 97% of cut's invocations in agent tool use are a later pipeline
+   ;; segment (7,766 of 7,976 measured); `head | cut` alone is 1,481.
+   {:argv ["-d:" "-f2"] :stdin "colon"}
+   {:argv ["-f1"] :stdin "tabs"}
+   {:argv ["-d:" "-f1,3"] :stdin "colon"}
+   {:argv ["-d:" "-f9"] :stdin "short"}
+   {:argv ["-f1"] :stdin "nosep"}
+   {:argv ["-f1"] :stdin "empty"}
+   {:argv ["-d:" "-s" "-f1"] :stdin "bare"}
+   ;; Past one pipe buffer: 1 MB of lines, field 2 of each.
+   {:argv ["-d6" "-f2"] :stdin :big}])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
@@ -161,7 +173,7 @@
         blob (.join path tmp "cut.bin")
         exe (.join path tmp "cut")
         exe-big (.join path tmp "cut-big")]
-    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39]}}" "utf8")
+    (.writeFileSync fs policy "{:allow #{[:cap/call 35] [:cap/call 37] [:cap/call 38] [:cap/call 39] [:cap/call 41]}}" "utf8")
     ;; The fixtures live in the tree the binary is packaged for. The native
     ;; loader refuses a relative request outright, so operands are absolute.
     (let [data (.join path tmp "data")]
@@ -190,20 +202,30 @@
       ;; the default 512 fuel counts almost nothing.
       (doseq [[out extra] [[exe ["--fuel" "50000000" "--pairs" "4096" "--string-pool" "8000000"]]]]
         (let [p (run "node" (into [kbb "--backend" "sci" packager "--code" blob "--offset" offset "--isa" "aarch64"
-                                  "--allow" "35,37,38,39"
+                                  "--allow" "35,37,38,39,41"
                                   "--fs-scope" (.realpathSync fs (.join path tmp "data"))
                                   "--output" out]
                                  extra) {})]
           (when (not= 0 (:status p)) (refuse (str "package failed: " (str (:err p))))))))
     ;; Now the only thing that matters: run it.
     (let [results
-          (for [names cases]
-            (let [argv (mapv #(if (str/starts-with? % "-")
+          (for [case cases]
+            (let [names (if (map? case) (:argv case) case)
+                  ;; A map case names a fixture (or :big) fed as standard input to
+                  ;; BOTH binaries; as a Buffer, since spawnSync applies :encoding
+                  ;; "buffer" to a string input and node refuses it.
+                  input (when (map? case)
+                          (let [f (:stdin case)]
+                            (if (= f :big)
+                              (.repeat "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde\n" 16384)
+                              (get fixtures f))))
+                  opts (if input {:input (js/Buffer.from input "utf8")} {})
+                  argv (mapv #(if (str/starts-with? % "-")
                                 %
                                 (.join path (.realpathSync fs (.join path tmp "data")) %))
                              names)
-                  k (run exe argv {})
-                  s (run system-cut argv {})
+                  k (run exe argv opts)
+                  s (run system-cut argv opts)
                   ;; stderr is compared too, now that there is a capability
                   ;; that can write it. Without this the `-n 0` case would
                   ;; pass on an empty stdout and the right exit status while
@@ -211,7 +233,8 @@
                   same? (and (= (.toString (:out k) "base64") (.toString (:out s) "base64"))
                              (= (.toString (:err k) "base64") (.toString (:err s) "base64"))
                              (= (:status k) (:status s)))]
-              {:argv names :ok same? :kotoba (.toString (:out k) "utf8")
+              {:argv (if (map? case) [(:argv case) :stdin (:stdin case)] names)
+                   :ok same? :kotoba (.toString (:out k) "utf8")
                :kotoba-err (.toString (:err k) "utf8")
                :system (.toString (:out s) "utf8")
                :exit [(:status k) (:status s)]}))

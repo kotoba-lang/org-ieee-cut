@@ -208,10 +208,24 @@ over 1,268,018 measured Bash calls; `head | cut` alone is 1,481). Whole-input
 form: input larger than the binary's string pool is refused (exit 120), never
 cut short.
 
+## `-c`: character positions
+
+`cut -c1-200` and its siblings are 5,598 of 1,268,018 measured agent Bash
+calls (2026-09-17) — the most frequent cut flag; agents truncate lines
+before they reach the context window. Positions count code points, as
+`/usr/bin/cut` does in a UTF-8 locale (`-c1-3` of 日本語テスト is 日本語 —
+the suite's multi-byte cases). The list grammar is `-f`'s. The list becomes
+a 4,096-entry table plus one open lower bound; selected characters are
+written as runs, one line per `arena-scope`, which is what let 1 MB through
+a 4,096-pair budget (a view per character had not). Positions past 4,095
+are refused with a message; two open ranges (`5-,9-`) are exact under 4,096
+and take the last bound beyond it — a named divergence, not a measured
+shape.
+
 ## What this is not
 
-No `-c`, `-b`, `-n` (`-s` landed since this was first written). `-d` must be
-joined to its argument (`-d:`), and `-f` to its list (`-f2`).
+No `-b`, `-n`. `-d` must be joined to its argument (`-d:`), `-f` and `-c`
+to their lists (`-f2`, `-c1-80`).
 
 One malformed spec is classified differently from BSD `cut`: a list with
 whitespace in it (`-f'1 ,2'`) is reported here as *illegal list value* where

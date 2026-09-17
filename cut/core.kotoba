@@ -2,6 +2,7 @@
 ;;
 ;;   cut -f N FILE        field N, delimited by TAB
 ;;   cut -dX -fN FILE     field N, delimited by X
+;;   cut -cLIST FILE      characters (code points) by position
 ;;   ... | cut ...        the same over standard input (wire 41)
 ;;
 ;; ## A line with no delimiter is printed WHOLE
@@ -594,7 +595,133 @@
             (each (+ i 1) total cfg worst))
         (do (complain path) (each (+ i 1) total cfg 1))))))
 
+;; --- -c: a list of CHARACTER positions ----------------------------------
+;;
+;; Measured 2026-09-17 over 1,268,018 agent Bash calls: `cut -c1-200`,
+;; `-c1-120`, `-c1-160`, ... 5,598 in all, the most frequent cut flag --
+;; agents truncate lines before they reach the context window. Positions
+;; count CODE POINTS, as /usr/bin/cut does in a UTF-8 locale (`-c1-3` of
+;; 日本語テスト is 日本語, measured), and the list has the same grammar as
+;; -f's, tested as a set. A reversed range (`-c3-1`) selects nothing and is
+;; not an error -- /usr/bin/cut prints empty lines and exits 0, measured.
+;;
+;; The list becomes a TABLE: V[k] = 1 when position k (1..4095) is selected,
+;; V[4096] = the smallest open lower bound (`N-`), or 0. Built with writes
+;; only, then read only -- the linearity rule for vector-assoc!. A bound past
+;; 4095 is refused with a message; the measured lists stop at 300.
+(defn char-text [] :string
+  (let [f (flag-from 0 (first-file) "-c")]
+    (if (string=? f "") "" (string-substring f 2 (string-byte-length f)))))
+
+(defn- mark-range [v :vector-i64 lo :i64 hi :i64] :vector-i64
+  (if (> lo hi) v (mark-range (vector-assoc! v lo 1) (+ lo 1) hi)))
+
+;; One item into V; a bound past the table answers V with slot 0 set to -1.
+(defn- mark-item [v :vector-i64 item :string] :vector-i64
+  (let [len (string-byte-length item)
+        d (string-index-of item "-")]
+    (if (< d 0)
+      (let [k (text->i64 item 0 len 0)]
+        (if (>= k 4096) (vector-assoc! v 0 -1) (vector-assoc! v k 1)))
+      (let [lo (string-substring item 0 d)
+            hi (string-substring item (+ d 1) len)
+            ln (string-byte-length lo)
+            hn (string-byte-length hi)
+            lov (if (= ln 0) 1 (text->i64 lo 0 ln 0))
+            hiv (if (= hn 0) 0 (text->i64 hi 0 hn 0))]
+        (if (>= lov 4096)
+          (vector-assoc! v 0 -1)
+          (if (= hiv 0)
+            ;; Open: everything from LOV on. Mark the table part and keep
+            ;; the smallest open bound in slot 4096 (0 = none yet).
+            (mark-range (vector-assoc! v 4096 lov) lov 4095)
+            (if (>= hiv 4096)
+              (vector-assoc! v 0 -1)
+              (mark-range v lov hiv))))))))
+
+(defn- mark-spec [v :vector-i64 spec :string] :vector-i64
+  (let [n (string-byte-length spec)
+        i (string-index-of spec ",")]
+    (if (< i 0)
+      (mark-item v spec)
+      (mark-spec (mark-item v (string-substring spec 0 i)) (string-substring spec (+ i 1) n)))))
+
+;; Two open ranges (`5-,9-`): the table holds positions under 4096 exactly,
+;; whichever bound was written last; past the table the LAST bound written
+;; decides, and for `5-,9-` that is 9 -- positions 4096 and beyond of a
+;; line longer than that would be dropped between two open ranges. Not a
+;; measured shape; named in the README rather than fixed with a comparison
+;; this build cannot express without reading the slot before writing it.
+
+(defn- cp-width [c :i64] :i64
+  (if (< c 128) 1 (if (< c 2048) 2 (if (< c 65536) 3 4))))
+
+(defn- char-selected? [v :vector-i64 k :i64] :bool
+  (if (< k 4096)
+    (= 1 (vector-at v k))
+    (let [open (vector-at v 4096)] (if (= open 0) false (>= k open)))))
+
+;; One line [i, end): the selected characters, written as RUNS -- a run of
+;; consecutive selected characters is one substring and one write, not one
+;; per character (the first cut minted a view per character and `-c1-30`
+;; over 1 MB met the pair budget at exit 120). STATE packs the run's start
+;; (-1 = no open run) above the position counter k: run * 2^22 + k, so a
+;; line may hold up to four million characters.
+(defn- run-of [state :i64] :i64 (- (quot state 4194304) 1))
+(defn- k-of [state :i64] :i64 (- state (* 4194304 (quot state 4194304))))
+(defn- pack [run :i64 k :i64] :i64 (+ (* (+ run 1) 4194304) k))
+
+(defn- cut-chars [v :vector-i64 text :string i :i64 end :i64 state :i64] :i64
+  (let [run (run-of state)
+        k (k-of state)]
+    (if (>= i end)
+      (do (if (>= run 0) (emit (string-substring text run end)) "") 0)
+      (let [c (string-code-point-at text i)
+            w (cp-width c)]
+        (if (char-selected? v k)
+          (cut-chars v text (+ i w) end (pack (if (< run 0) i run) (+ k 1)))
+          (do (if (>= run 0) (emit (string-substring text run i)) "")
+              (cut-chars v text (+ i w) end (pack -1 (+ k 1)))))))))
+
+;; One line inside its own region, so the views it minted are reclaimed.
+(defn- cut-line [v :vector-i64 text :string pos :i64 end :i64] :i64
+  (do (cut-chars v text pos end (pack -1 1)) (emit (nl)) 0))
+
+;; Every line of TEXT. A last line without a newline gets one, as cut adds.
+(defn- walk-chars [v :vector-i64 text :string pos :i64] :i64
+  (let [n (string-byte-length text)]
+    (if (>= pos n)
+      0
+      (let [nl-at (string-find-byte text 10 pos)
+            end (if (< nl-at 0) n nl-at)]
+        (do (arena-scope (cut-line v text pos end))
+            (walk-chars v text (+ end 1)))))))
+
+(defn- each-chars [i :i64 total :string v :vector-i64 worst :i64] :i64
+  (if (string=? (decimal-of i) total)
+    worst
+    (let [path (arg (decimal-of i))]
+      (if (readable? path)
+        (do (walk-chars v (slurp-file path) 0) (each-chars (+ i 1) total v worst))
+        (do (complain path) (each-chars (+ i 1) total v 1))))))
+
+(defn- run-chars [spec :string] :i64
+  (let [bad (classify-spec spec)]
+    (if (= bad 1)
+      (do (emit-error "cut: [-bcf] list: illegal list value") (emit-error (nl)) 1)
+      (if (= bad 2)
+        (do (emit-error "cut: [-bcf] list: values may not include zero") (emit-error (nl)) 1)
+        (let [total (arg "")
+              start (first-file)]
+          (if (= -1 (vector-at (mark-spec (vector-alloc 4097) spec) 0))
+            (do (emit-error "cut: -c positions past 4095 are not supported by this build") (emit-error (nl)) 1)
+            (if (string=? (decimal-of start) total)
+              (do (walk-chars (mark-spec (vector-alloc 4097) spec) (stdin "") 0) 0)
+              (each-chars start total (mark-spec (vector-alloc 4097) spec) 0))))))))
+
 (defn main [] :i64
+  (if (not (string=? (char-text) ""))
+    (run-chars (char-text))
   (let [spec (field-text)
         total (arg "")
         start (first-file)
@@ -615,4 +742,4 @@
         ;; Input past the string pool is refused, never cut short.
         (if (string=? (decimal-of start) total)
           (do (walk (stdin "") (delim) (spec->cfg spec (suppress?) (delim))) 0)
-          (each start total (spec->cfg spec (suppress?) (delim)) 0))))))
+          (each start total (spec->cfg spec (suppress?) (delim)) 0)))))))

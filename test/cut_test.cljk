@@ -46,6 +46,8 @@
 ;;                         not what POSIX says
 (def fixtures
   {"colon"  "a:b:c\nd:e:f\n"
+   ;; Multi-byte lines for -c: characters, not bytes.
+   "utf8c"  "\u65e5\u672c\u8a9e\u30c6\u30b9\u30c8\nab\u00e9d\n"
    "tabs"   "one\ttwo\tthree\n"
    ;; No delimiter at all: cut prints the line WHOLE.
    "nosep"  "nofield\n"
@@ -154,7 +156,16 @@
    {:argv ["-f1"] :stdin "empty"}
    {:argv ["-d:" "-s" "-f1"] :stdin "bare"}
    ;; Past one pipe buffer: 1 MB of lines, field 2 of each.
-   {:argv ["-d6" "-f2"] :stdin :big}])
+   {:argv ["-d6" "-f2"] :stdin :big}
+   ;; --- -c: character positions (2026-09-17) ------------------------------
+   ;; `cut -c1-200` and its siblings are 5,598 measured calls, the most
+   ;; frequent cut flag. Positions are code points: the utf8 fixture is the
+   ;; case that separates characters from bytes.
+   ["-c1-3" "colon"] ["-c1-200" "colon"] ["-c3-" "colon"] ["-c-3" "colon"] ["-c2,4,6" "colon"]
+   ["-c1-2,5-" "colon"] ["-c5-20" "colon"] ["-c1-3,2-4" "colon"] ["-c20" "colon"] ["-c1" "empty"]
+   ["-c1-3" "utf8c"] ["-c2" "utf8c"] ["-c2-" "utf8c"] ["-c1-3" "nonl"] ["-c3-1" "colon"]
+   ["-c0" "colon"] ["-cx" "colon"] ["-c1-3" "colon" "tabs"] ["-c1-3" "missing" "colon"]
+   {:argv ["-c1-4"] :stdin "colon"} {:argv ["-c2-"] :stdin "utf8c"} {:argv ["-c1-30"] :stdin :big}])
 
 (when-not amu-home (refuse "set AMU_HOME to an amu checkout"))
 (let [amu (.join path amu-home "bin" "amu")
